@@ -1,0 +1,283 @@
+import { CheckDetail, NormalizedTarget, SourceResult, TestName, TestSelection } from './types';
+import { compactRaw, errorMessage, sleep } from './utils';
+
+const API = 'https://api.globalping.io/v1';
+const DEFAULT_REQUEST_TIMEOUT_MS = 12000;
+const DEFAULT_MEASUREMENT_TIMEOUT_MS = 45000;
+const DEFAULT_POLL_INTERVAL_MS = 550;
+
+type DnsRecordType = 'A' | 'AAAA';
+type PingProtocol = 'ICMP' | 'TCP';
+
+export interface GlobalpingClientOptions {
+  country: string;
+  token?: string;
+  requestTimeoutMs?: number;
+  measurementTimeoutMs?: number;
+  pollIntervalMs?: number;
+}
+
+interface MeasurementRun {
+  detail: CheckDetail;
+  probe?: any;
+  measurementId?: string;
+}
+
+export class GlobalpingClient {
+  constructor(private readonly options: GlobalpingClientOptions) {}
+
+  private headers(): Record<string, string> {
+    const h: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'User-Agent': 'Multi-ISP-Domain-Checker/0.1'
+    };
+    if (this.options.token) h.Authorization = `Bearer ${this.options.token}`;
+    return h;
+  }
+
+  private async request(url: string, init: RequestInit = {}, timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS): Promise<{ response: Response; body: any; bodyText: string }> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+    try {
+      const response = await fetch(url, { ...init, signal: controller.signal });
+      const bodyText = await response.text();
+      let body: any = {};
+      try { body = bodyText ? JSON.parse(bodyText) : {}; } catch { body = { message: bodyText }; }
+      return { response, body, bodyText };
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error(`Globalping request timed out after ${timeoutMs} ms.`);
+      throw new Error(`Globalping request failed: ${errorMessage(error)}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private apiError(response: Response, body: any, bodyText: string): string {
+    const message = body?.error?.message || body?.message || bodyText || response.statusText;
+    if (response.status !== 429) return `Globalping ${response.status}: ${message}`;
+    const remaining = response.headers.get('x-ratelimit-remaining') || response.headers.get('x-credits-remaining');
+    const reset = response.headers.get('x-ratelimit-reset');
+    const limits = [remaining != null ? `remaining: ${remaining}` : '', reset ? `reset: ${reset}s` : ''].filter(Boolean).join(', ');
+    return `Globalping 429: ${message}${limits ? ` (${limits})` : ''}`;
+  }
+
+  private async create(type: TestName, target: NormalizedTarget, network: string, dnsRecordType: DnsRecordType = 'A', pingProtocol: PingProtocol = 'ICMP', reuseMeasurementId?: string): Promise<{ id: string; probesCount: number }> {
+    const payload: Record<string, unknown> = {
+      target: target.hostname,
+      type,
+      inProgressUpdates: false,
+      locations: reuseMeasurementId || [{ magic: `${this.options.country}+${network}`, limit: 1 }]
+    };
+
+    if (type === 'ping') payload.measurementOptions = {
+      packets: 3,
+      protocol: pingProtocol,
+      ...(pingProtocol === 'TCP' ? { port: target.port } : {}),
+      ipVersion: 4
+    };
+    if (type === 'dns') payload.measurementOptions = { query: { type: dnsRecordType }, protocol: 'UDP', ipVersion: 4 };
+    if (type === 'traceroute') payload.measurementOptions = { protocol: 'ICMP', ipVersion: 4 };
+    if (type === 'http') {
+      const url = new URL(target.url);
+      const request: Record<string, string> = { method: 'GET', path: url.pathname || '/' };
+      if (url.search) request.query = url.search.slice(1);
+      payload.measurementOptions = {
+        protocol: target.protocol === 'https:' ? 'HTTPS' : 'HTTP',
+        port: target.port,
+        request
+      };
+    }
+
+    const { response, body, bodyText } = await this.request(`${API}/measurements`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) throw new Error(this.apiError(response, body, bodyText));
+    if (!body.id) throw new Error('Globalping response did not include a measurement id.');
+    return { id: String(body.id), probesCount: Number(body.probesCount ?? 0) };
+  }
+
+  private async get(id: string, timeoutMs?: number): Promise<any> {
+    const { response, body, bodyText } = await this.request(
+      `${API}/measurements/${encodeURIComponent(id)}`,
+      { headers: this.headers() },
+      timeoutMs
+    );
+    if (!response.ok) throw new Error(this.apiError(response, body, bodyText));
+    return body;
+  }
+
+  private async waitForResult(id: string): Promise<any> {
+    const timeoutMs = this.options.measurementTimeoutMs ?? DEFAULT_MEASUREMENT_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now();
+      const measurement = await this.get(id, Math.min(this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS, remaining));
+      if (measurement.status !== 'in-progress') return measurement;
+      await sleep(Math.min(this.options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
+    }
+    throw new Error(`Globalping measurement timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+  }
+
+  private normalize(type: TestName, measurement: any): { detail: CheckDetail; probe?: any } {
+    const first = measurement?.results?.[0];
+    if (!first) {
+      return { detail: { ok: false, summary: `No probe result (${measurement?.status || 'unknown status'})`, raw: compactRaw(JSON.stringify(measurement, null, 2)) } };
+    }
+    const r = first.result || {};
+    let ok = r.status === 'finished' || (!r.status && measurement.status === 'finished');
+    let summary = r.status || measurement.status || 'finished';
+    let latencyMs: number | undefined;
+    const data: Record<string, unknown> = {
+      resolvedAddress: r.resolvedAddress,
+      resolvedHostname: r.resolvedHostname,
+      failureSource: r.failureSource
+    };
+
+    if (type === 'dns') {
+      const answers = Array.isArray(r.answers) ? r.answers : [];
+      const values = answers.map((a: any) => a?.value).filter(Boolean);
+      ok = ok && Number(r.statusCode ?? 0) === 0;
+      summary = `${r.statusCodeName || r.statusCode || r.status || 'DNS'}${values.length ? `: ${values.join(', ')}` : ': no records'}`;
+      latencyMs = typeof r.timings?.total === 'number' ? r.timings.total : undefined;
+      Object.assign(data, { resolver: r.resolver, statusCode: r.statusCode, statusCodeName: r.statusCodeName, answers });
+    } else if (type === 'ping') {
+      const stats = r.stats || {};
+      ok = ok && Number(stats.loss ?? 100) < 100;
+      summary = stats.avg != null ? `avg ${stats.avg} ms, loss ${stats.loss ?? '?'}%` : (r.status || 'Ping finished');
+      latencyMs = typeof stats.avg === 'number' ? stats.avg : undefined;
+      Object.assign(data, { stats });
+    } else if (type === 'http') {
+      const statusCode = Number(r.statusCode || 0);
+      summary = statusCode ? `HTTP ${statusCode}` : (r.status || 'HTTP test finished');
+      latencyMs = typeof r.timings?.total === 'number' ? r.timings.total : undefined;
+      Object.assign(data, { statusCode, headers: r.headers, timings: r.timings, tls: r.tls });
+    } else if (type === 'traceroute') {
+      const hops = Array.isArray(r.hops) ? r.hops : [];
+      summary = ok ? `${hops.length} hop${hops.length === 1 ? '' : 's'}` : (r.status || 'Traceroute failed');
+      Object.assign(data, { hops });
+    }
+
+    return {
+      probe: first.probe,
+      detail: {
+        ok,
+        summary,
+        latencyMs,
+        raw: compactRaw(r.rawOutput),
+        data
+      }
+    };
+  }
+
+  private mergeDns(a: CheckDetail, aaaa: CheckDetail): CheckDetail {
+    const aAnswers = (a.data?.answers as any[] | undefined) ?? [];
+    const aaaaAnswers = (aaaa.data?.answers as any[] | undefined) ?? [];
+    const ipv4 = aAnswers.filter(v => v?.type === 'A').map(v => String(v?.value ?? '')).filter(Boolean);
+    const ipv6 = aaaaAnswers.filter(v => v?.type === 'AAAA').map(v => String(v?.value ?? '')).filter(Boolean);
+    const raw = [a.raw ? `--- A ---\n${a.raw}` : '', aaaa.raw ? `--- AAAA ---\n${aaaa.raw}` : ''].filter(Boolean).join('\n\n');
+    return {
+      ok: a.ok && aaaa.ok,
+      summary: `A: ${ipv4.join(', ') || (a.ok ? 'no records' : a.summary)}; AAAA: ${ipv6.join(', ') || (aaaa.ok ? 'no records' : aaaa.summary)}`,
+      latencyMs: Math.max(a.latencyMs ?? 0, aaaa.latencyMs ?? 0) || undefined,
+      raw: compactRaw(raw),
+      data: { ipv4, ipv6, answers: [...aAnswers, ...aaaaAnswers], a: a.data, aaaa: aaaa.data }
+    };
+  }
+
+  private addHttpLayers(result: SourceResult, target: NormalizedTarget): void {
+    const http = result.http;
+    if (!http?.ok) return;
+    const timings = http.data?.timings as Record<string, unknown> | undefined;
+    if (!result.tcp && typeof timings?.tcp === 'number') {
+      result.tcp = { ok: true, summary: `TCP ${target.port} connected`, latencyMs: timings.tcp, data: { resolvedAddress: http.data?.resolvedAddress } };
+    }
+    const certificate = http.data?.tls as Record<string, any> | null | undefined;
+    if (target.protocol === 'https:' && certificate) {
+      result.tls = {
+        ok: true,
+        summary: `${certificate.protocol || 'TLS'}; certificate ${certificate.authorized ? 'valid' : 'not trusted/invalid'}`,
+        latencyMs: typeof timings?.tls === 'number' ? timings.tls : undefined,
+        data: {
+          authorized: certificate.authorized,
+          authorizationError: certificate.error ?? null,
+          protocol: certificate.protocol,
+          cipher: certificate.cipherName,
+          subject: certificate.subject?.CN,
+          subjectAltNames: certificate.subject?.alt,
+          issuer: certificate.issuer?.CN,
+          validFrom: certificate.createdAt,
+          validTo: certificate.expiresAt,
+          fingerprint256: certificate.fingerprint256
+        }
+      };
+    }
+  }
+
+  async runSingle(type: TestName, target: NormalizedTarget, network: string, dnsRecordType: DnsRecordType = 'A', pingProtocol: PingProtocol = 'ICMP', reuseMeasurementId?: string): Promise<MeasurementRun> {
+    let measurementId: string | undefined;
+    try {
+      const created = await this.create(type, target, network, dnsRecordType, pingProtocol, reuseMeasurementId);
+      if (created.probesCount < 1) throw new Error(`No matching online probe for ${this.options.country}+${network}.`);
+      measurementId = created.id;
+      const measurement = await this.waitForResult(created.id);
+      return { ...this.normalize(type, measurement), measurementId };
+    } catch (error) {
+      return { detail: { ok: false, summary: errorMessage(error) }, measurementId };
+    }
+  }
+
+  async runNetwork(target: NormalizedTarget, network: string, selection: TestSelection): Promise<SourceResult> {
+    const result: SourceResult = {
+      source: network,
+      sourceType: 'remote',
+      network,
+      location: `${this.options.country}+${network}`,
+      diagnosis: []
+    };
+
+    const specs: Array<{ key: string; type: TestName; dnsRecordType?: DnsRecordType; pingProtocol?: PingProtocol }> = [];
+    if (selection.dns) specs.push({ key: 'dnsA', type: 'dns', dnsRecordType: 'A' }, { key: 'dnsAAAA', type: 'dns', dnsRecordType: 'AAAA' });
+    if (selection.ping) specs.push({ key: 'ping', type: 'ping' });
+    if (selection.http) specs.push({ key: 'tcp', type: 'ping', pingProtocol: 'TCP' }, { key: 'http', type: 'http' });
+    if (selection.traceroute) specs.push({ key: 'traceroute', type: 'traceroute' });
+    if (!specs.length) return result;
+
+    const seedSpec = specs[0];
+    const seed = await this.runSingle(seedSpec.type, target, network, seedSpec.dnsRecordType, seedSpec.pingProtocol);
+    const runs = new Map<string, MeasurementRun>([[seedSpec.key, seed]]);
+
+    if (seed.measurementId) {
+      const remaining = await Promise.all(specs.slice(1).map(async spec => ({
+        spec,
+        run: await this.runSingle(spec.type, target, network, spec.dnsRecordType, spec.pingProtocol, seed.measurementId)
+      })));
+      for (const item of remaining) runs.set(item.spec.key, item.run);
+    } else {
+      for (const spec of specs.slice(1)) runs.set(spec.key, { detail: { ...seed.detail } });
+    }
+
+    if (selection.dns) result.dns = this.mergeDns(runs.get('dnsA')!.detail, runs.get('dnsAAAA')!.detail);
+    if (selection.ping) result.ping = runs.get('ping')!.detail;
+    if (selection.http) {
+      const tcp = runs.get('tcp')!.detail;
+      result.tcp = { ...tcp, summary: `TCP ${target.port} ${tcp.ok ? 'connected' : 'failed'}: ${tcp.summary}` };
+      result.http = runs.get('http')!.detail;
+    }
+    if (selection.traceroute) result.traceroute = runs.get('traceroute')!.detail;
+
+    for (const run of runs.values()) {
+      if (!run.probe) continue;
+      result.network = run.probe.network || result.network;
+      result.asn = run.probe.asn || result.asn;
+      const parts = [run.probe.city, run.probe.country].filter(Boolean);
+      if (parts.length) result.location = parts.join(', ');
+      break;
+    }
+    this.addHttpLayers(result, target);
+    return result;
+  }
+}

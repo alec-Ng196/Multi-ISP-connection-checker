@@ -1,0 +1,84 @@
+{
+  "name": "multi-isp-domain-checker",
+  "displayName": "Multi-ISP Domain Checker",
+  "description": "Test a domain locally and from multiple ISP/network probes using Globalping.",
+  "version": "0.1.0",
+  "publisher": "local-dev",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onView:multiIspChecker.view",
+    "onCommand:multiIspChecker.runTest"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "multiIspChecker.runTest",
+        "title": "Multi-ISP: Test Domain"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "multiIspChecker",
+          "title": "Multi-ISP Checker",
+          "icon": "media/network.svg"
+        }
+      ]
+    },
+    "views": {
+      "multiIspChecker": [
+        {
+          "id": "multiIspChecker.view",
+          "name": "Domain Checker",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Multi-ISP Domain Checker",
+      "properties": {
+        "multiIspChecker.country": {
+          "type": "string",
+          "default": "VN",
+          "description": "Country code used for Globalping network filters."
+        },
+        "multiIspChecker.remoteNetworks": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["Viettel", "FPT", "VNPT", "MobiFone"],
+          "description": "Network names passed to Globalping magic location filtering."
+        },
+        "multiIspChecker.globalpingToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Globalping API token. Prefer setting GLOBALPING_TOKEN in the VS Code process environment for shared machines."
+        },
+        "multiIspChecker.timeoutMs": {
+          "type": "number",
+          "default": 8000,
+          "minimum": 1000,
+          "maximum": 30000,
+          "description": "Timeout for local TCP/TLS/HTTP tests."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "test": "npm run compile && node --test test/regression.test.js",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.7.2"
+  }
+}
