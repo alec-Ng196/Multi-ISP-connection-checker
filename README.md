@@ -61,7 +61,6 @@ Remote network filters:
 Viettel
 FPT
 VNPT
-MobiFone
 ```
 
 Change them in Settings under **Multi-ISP Domain Checker** or directly in the sidebar for an individual run.
