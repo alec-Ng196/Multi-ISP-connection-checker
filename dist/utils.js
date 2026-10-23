@@ -19,6 +19,8 @@ function normalizeTarget(input) {
     if (!['http:', 'https:'].includes(url.protocol)) {
         throw new Error('Only HTTP and HTTPS targets are supported.');
     }
+    if (url.username || url.password)
+        throw new Error('Không đặt username/password trong URL. Dùng trường HTTP headers của chế độ HTTP / WAF.');
     const hostname = url.hostname;
     if (!hostname || hostname.length > 253 || /[\s/\\]/.test(hostname)) {
         throw new Error('Invalid hostname.');

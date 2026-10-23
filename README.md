@@ -1,6 +1,20 @@
 # Multi-ISP Domain Checker
 
-A VS Code extension for comparing domain connectivity from your local machine and remote network probes.
+A VS Code extension for comparing domain connectivity, inspecting DNS records, and measuring HTTP requests from your machine.
+
+For step-by-step Vietnamese instructions, examples and interpretation of results, read [QUICKSTART.md](QUICKSTART.md).
+
+## Three diagnostic modes
+
+| Mode | Capabilities |
+|---|---|
+| **Kết nối đa ISP** | Existing local and Globalping DNS/TCP/TLS/HTTP, ping, traceroute and cross-network comparisons. |
+| **DNS records** | Local A, AAAA, CNAME, MX, TXT, NS, SOA, CAA and SRV queries; optional resolver; CNAME chain; record details and TTL where available. |
+| **HTTP / WAF** | Local request timeline for DNS, TCP, TLS, upload, headers and full body; stage deadlines and total deadline; repeated samples, timeout rate and p50/p95/p99. Custom method/headers/body and optional direct-origin comparison preserve the original Host/SNI and certificate verification. |
+
+DNS and HTTP diagnostics support cancellation. Results have session history (up to 10 runs), JSON copy/export, and optional JSON/JSONL WAF log matching by request ID. Reports omit request headers/body and redact URL query values. Custom HTTP options apply only to the local HTTP / WAF mode.
+
+HTTP headers timing is receipt of parsed response headers, not exact first-byte timing. HTTP 408/504 responses are counted separately from client deadlines. Client measurements cannot isolate Cloudrity/WAF → backend timing without matching server logs; public-versus-origin differences are not WAF processing time. Requests use fresh connections and do not follow redirects. POST/PUT/PATCH/DELETE send real requests for every sample and selected route.
 
 ## What it checks
 
@@ -26,6 +40,8 @@ npm install
 npm run compile
 ```
 
+Run the deterministic local test suite with `npm test`. On PowerShell systems that block `npm.ps1`, use `npm.cmd` for these commands. Rebuild `dist/` after source changes, then reload the Extension Development Host.
+
 ## Build a VSIX
 
 ```bash
@@ -49,6 +65,8 @@ MobiFone
 ```
 
 Change them in Settings under **Multi-ISP Domain Checker** or directly in the sidebar for an individual run.
+
+`multiIspChecker.timeoutMs` controls the legacy local connectivity checks. DNS record queries and HTTP / WAF have their own timeout controls in the sidebar; these do not configure Globalping remote timeouts.
 
 ## Optional Globalping token
 

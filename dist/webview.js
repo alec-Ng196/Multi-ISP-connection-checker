@@ -35,14 +35,24 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.CheckerViewProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const node_crypto_1 = require("node:crypto");
 const utils_1 = require("./utils");
 const localTester_1 = require("./localTester");
 const globalping_1 = require("./globalping");
 const analyzer_1 = require("./analyzer");
+const dnsDiagnostics_1 = require("./dnsDiagnostics");
+const httpDiagnostics_1 = require("./httpDiagnostics");
+const diagnosticsView_1 = require("./diagnosticsView");
+const wafLogs_1 = require("./wafLogs");
+const reports_1 = require("./reports");
 class CheckerViewProvider {
     context;
     static viewType = 'multiIspChecker.view';
     view;
+    busy = false;
+    controller;
+    history = [];
+    selectedId;
     constructor(context) {
         this.context = context;
     }
@@ -50,232 +60,181 @@ class CheckerViewProvider {
         this.view = webviewView;
         webviewView.webview.options = { enableScripts: true };
         webviewView.webview.html = this.html(webviewView.webview);
-        webviewView.webview.onDidReceiveMessage(async (message) => {
-            if (message?.type === 'run')
-                await this.handleRun(message.payload);
-            if (message?.type === 'loadConfig')
-                this.postConfig();
-        });
+        webviewView.webview.onDidReceiveMessage(message => { void this.onMessage(message); });
+        webviewView.onDidDispose(() => { this.controller?.abort(); this.view = undefined; });
         this.postConfig();
+        this.postHistory();
     }
-    focusAndRun() {
-        this.view?.show?.(true);
-        this.view?.webview.postMessage({ type: 'focusDomain' });
+    async focusAndRun() {
+        await vscode.commands.executeCommand('multiIspChecker.view.focus');
+        this.view?.show(true);
+        this.post('focusDomain');
     }
+    post(type, payload) { this.view?.webview.postMessage({ type, payload }); }
     postConfig() {
-        if (!this.view)
-            return;
         const cfg = vscode.workspace.getConfiguration('multiIspChecker');
-        this.view.webview.postMessage({
-            type: 'config',
-            payload: {
-                country: cfg.get('country', 'VN'),
-                networks: cfg.get('remoteNetworks', ['Viettel', 'FPT', 'VNPT', 'MobiFone'])
-            }
-        });
+        this.post('config', { country: cfg.get('country', 'VN'), networks: cfg.get('remoteNetworks', ['Viettel', 'FPT', 'VNPT', 'MobiFone']) });
     }
-    async handleRun(request) {
-        if (!this.view)
+    postHistory() {
+        this.post('history', this.history.map(({ id, mode, url, startedAt }) => ({ id, mode, url, startedAt })));
+    }
+    save(run) {
+        const safe = (0, reports_1.sanitizeReport)(run);
+        this.history = [safe, ...this.history.filter(item => item.id !== run.id)].slice(0, 10);
+        this.selectedId = run.id;
+        this.postHistory();
+        this.showRun(safe);
+    }
+    showRun(run) {
+        this.selectedId = run.id;
+        this.post(run.mode === 'connectivity' ? 'result' : 'diagnosticResult', { ...run.report, id: run.id });
+    }
+    getRun(id) {
+        const run = this.history.find(item => item.id === (typeof id === 'string' ? id : this.selectedId));
+        if (!run)
+            throw new Error('Chưa có kết quả. Chạy phép đo hoặc chọn lịch sử trước.');
+        return run;
+    }
+    async onMessage(message) {
+        if (!message || typeof message.type !== 'string')
             return;
-        const webview = this.view.webview;
         try {
-            const target = (0, utils_1.normalizeTarget)(request.domain);
-            const cfg = vscode.workspace.getConfiguration('multiIspChecker');
-            const country = cfg.get('country', 'VN').toUpperCase();
-            const timeoutMs = cfg.get('timeoutMs', 8000);
-            const token = process.env.GLOBALPING_TOKEN || cfg.get('globalpingToken', '') || undefined;
-            const networks = (request.networks || []).map(v => v.trim()).filter(Boolean).slice(0, 8);
-            if (!request.selection.local && !request.selection.remote)
-                throw new Error('Select Local and/or Remote tests.');
-            if (![request.selection.dns, request.selection.ping, request.selection.http, request.selection.traceroute].some(Boolean)) {
-                throw new Error('Select at least one test type.');
+            switch (message.type) {
+                case 'loadConfig':
+                    this.postConfig();
+                    this.postHistory();
+                    break;
+                case 'history':
+                    this.postHistory();
+                    break;
+                case 'cancel':
+                    this.controller?.abort();
+                    break;
+                case 'run':
+                    await this.withRun(() => this.handleRun(message.payload));
+                    break;
+                case 'runDiagnostic':
+                    await this.withRun(() => this.handleDiagnostic(message.payload));
+                    break;
+                case 'loadRun':
+                    if (!this.busy)
+                        this.showRun(this.getRun(message.id));
+                    break;
+                case 'copy':
+                    await vscode.env.clipboard.writeText(JSON.stringify(this.getRun(message.id).report, null, 2));
+                    this.post('notice', 'Đã sao chép JSON; giá trị query trong URL đã được ẩn.');
+                    break;
+                case 'export':
+                    await this.exportRun(message.id);
+                    break;
+                case 'importLogs':
+                    if (!this.busy)
+                        await this.importLogs(message.id);
+                    break;
             }
-            webview.postMessage({ type: 'progress', payload: 'Starting tests…' });
-            const startedAt = new Date().toISOString();
-            const results = [];
-            if (request.selection.local) {
-                webview.postMessage({ type: 'progress', payload: 'Running local checks…' });
-                results.push(await (0, localTester_1.runLocalTests)(target, request.selection, timeoutMs));
-            }
-            if (request.selection.remote) {
-                if (!networks.length)
-                    throw new Error('Add at least one remote network.');
-                const client = new globalping_1.GlobalpingClient({ country, token });
-                webview.postMessage({ type: 'progress', payload: `Running Globalping checks for ${networks.length} network(s)…` });
-                const remoteResults = await Promise.all(networks.map(network => client.runNetwork(target, network, request.selection)));
-                results.push(...remoteResults);
-            }
-            const response = (0, analyzer_1.finalize)({
-                target,
-                startedAt,
-                finishedAt: new Date().toISOString(),
-                results,
-                comparison: []
-            });
-            webview.postMessage({ type: 'result', payload: response });
         }
         catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            webview.postMessage({ type: 'error', payload: message });
-            vscode.window.showErrorMessage(`Multi-ISP Checker: ${message}`);
+            this.post('notice', 'Lỗi: ' + (0, utils_1.errorMessage)(error));
         }
     }
-    html(webview) {
-        const nonce = String(Date.now());
-        return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 12px; margin: 0; }
-  h2 { font-size: 15px; margin: 0 0 10px; }
-  h3 { font-size: 13px; margin: 14px 0 8px; }
-  label { display: block; font-size: 12px; margin: 8px 0 4px; }
-  input[type=text], textarea { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); padding: 7px 8px; border-radius: 2px; }
-  textarea { min-height: 74px; resize: vertical; }
-  .row { display: flex; flex-wrap: wrap; gap: 8px 12px; margin: 8px 0; }
-  .check { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; }
-  button { border: 0; padding: 8px 12px; cursor: pointer; border-radius: 2px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-  button:hover { background: var(--vscode-button-hoverBackground); }
-  button:disabled { opacity: .55; cursor: default; }
-  .secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
-  .hint, .meta { color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.45; }
-  #status { margin: 10px 0; font-size: 12px; min-height: 18px; }
-  .error { color: var(--vscode-errorForeground); }
-  .summary { border: 1px solid var(--vscode-panel-border); padding: 8px; margin: 8px 0 12px; border-radius: 3px; }
-  .source { border-top: 1px solid var(--vscode-panel-border); padding: 10px 0; }
-  .source:first-child { border-top: 0; }
-  .source-title { font-weight: 600; display: flex; gap: 6px; flex-wrap: wrap; }
-  .badge { font-size: 10px; padding: 1px 5px; border-radius: 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
-  .test { display: grid; grid-template-columns: 82px 1fr; gap: 6px; margin: 5px 0; font-size: 12px; }
-  .ok { color: var(--vscode-testing-iconPassed, #4caf50); }
-  .bad { color: var(--vscode-testing-iconFailed, #f44336); }
-  details { margin: 5px 0; }
-  pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 10px; background: var(--vscode-textCodeBlock-background); padding: 7px; max-height: 260px; overflow: auto; }
-  ul { margin: 5px 0 0 18px; padding: 0; font-size: 12px; }
-</style>
-</head>
-<body>
-  <h2>Multi-ISP Domain Checker</h2>
-  <label for="domain">Domain / URL</label>
-  <input id="domain" type="text" placeholder="https://example.com/" value="https://example.com/">
-
-  <div class="row">
-    <label class="check"><input id="local" type="checkbox" checked> Local</label>
-    <label class="check"><input id="remote" type="checkbox" checked> Remote probes</label>
-  </div>
-
-  <label for="networks">Remote networks (one per line)</label>
-  <textarea id="networks">Viettel\nFPT\nVNPT\nMobiFone</textarea>
-  <div id="countryHint" class="hint">Globalping filter: VN + network name. A network may have no online probe at a given time.</div>
-
-  <h3>Checks</h3>
-  <div class="row">
-    <label class="check"><input id="dns" type="checkbox" checked> DNS</label>
-    <label class="check"><input id="ping" type="checkbox" checked> Ping</label>
-    <label class="check"><input id="http" type="checkbox" checked> HTTP/TLS</label>
-    <label class="check"><input id="traceroute" type="checkbox"> Traceroute</label>
-  </div>
-  <p class="hint">Traceroute is off by default because it is slower and consumes additional Globalping tests.</p>
-
-  <div class="row">
-    <button id="run">Run test</button>
-    <button id="clear" class="secondary" type="button">Clear results</button>
-  </div>
-  <div id="status" role="status" aria-live="polite"></div>
-  <div id="results"></div>
-
-<script nonce="${nonce}">
-const vscode = acquireVsCodeApi();
-const $ = id => document.getElementById(id);
-const esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]));
-let running = false;
-
-function selected() {
-  return {
-    local: $('local').checked,
-    remote: $('remote').checked,
-    dns: $('dns').checked,
-    ping: $('ping').checked,
-    http: $('http').checked,
-    traceroute: $('traceroute').checked
-  };
-}
-
-function run() {
-  if (running) return;
-  const domain = $('domain').value.trim();
-  if (!domain) { $('status').innerHTML = '<span class="error">Enter a domain or URL.</span>'; return; }
-  const networks = $('networks').value.split(/\\r?\\n|,/).map(v => v.trim()).filter(Boolean);
-  running = true;
-  $('run').disabled = true;
-  $('status').textContent = 'Starting…';
-  $('results').innerHTML = '';
-  vscode.postMessage({ type: 'run', payload: { domain, networks, selection: selected() } });
-}
-
-function renderTest(name, detail) {
-  if (!detail) return '';
-  const cls = detail.ok ? 'ok' : 'bad';
-  const icon = detail.ok ? '✓' : '✕';
-  const latency = Number.isFinite(detail.latencyMs) ? ' · ' + Math.round(detail.latencyMs) + ' ms' : '';
-  const raw = detail.raw ? '<details><summary>Raw output</summary><pre>' + esc(detail.raw) + '</pre></details>' : '';
-  const data = detail.data && Object.keys(detail.data).length ? '<details><summary>Structured data</summary><pre>' + esc(JSON.stringify(detail.data, null, 2)) + '</pre></details>' : '';
-  return '<div class="test"><div>' + esc(name) + '</div><div><span class="' + cls + '">' + icon + ' ' + esc(detail.summary) + '</span>' + latency + raw + data + '</div></div>';
-}
-
-function render(payload) {
-  let html = '<div class="summary"><strong>' + esc(payload.target.url) + '</strong><div class="meta">' + esc(payload.startedAt) + ' → ' + esc(payload.finishedAt) + '</div>';
-  html += '<ul>' + payload.comparison.map(x => '<li>' + esc(x) + '</li>').join('') + '</ul></div>';
-  for (const r of payload.results) {
-    const probe = [r.network, r.asn ? 'AS' + r.asn : '', r.location].filter(Boolean).join(' · ');
-    html += '<section class="source"><div class="source-title">' + esc(r.source) + ' <span class="badge">' + esc(r.sourceType) + '</span></div>';
-    if (probe) html += '<div class="meta">' + esc(probe) + '</div>';
-    html += renderTest('DNS', r.dns);
-    html += renderTest('TCP', r.tcp);
-    html += renderTest('TLS', r.tls);
-    html += renderTest('HTTP', r.http);
-    html += renderTest('Ping', r.ping);
-    html += renderTest('Traceroute', r.traceroute);
-    html += '<h3>Diagnosis</h3><ul>' + (r.diagnosis || []).map(x => '<li>' + esc(x) + '</li>').join('') + '</ul></section>';
-  }
-  $('results').innerHTML = html;
-}
-
-$('run').addEventListener('click', run);
-$('domain').addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
-$('clear').addEventListener('click', () => { $('results').innerHTML = ''; $('status').textContent = ''; });
-window.addEventListener('message', event => {
-  const msg = event.data;
-  if (msg.type === 'config') {
-    if (Array.isArray(msg.payload.networks)) $('networks').value = msg.payload.networks.join('\\n');
-    $('countryHint').textContent = 'Globalping filter: ' + msg.payload.country + ' + network name. A network may have no online probe at a given time.';
-  } else if (msg.type === 'progress') {
-    $('status').textContent = msg.payload;
-  } else if (msg.type === 'result') {
-    running = false;
-    $('run').disabled = false;
-    const failed = msg.payload.results.reduce((count, result) => count +
-      ['dns', 'tcp', 'tls', 'http', 'ping', 'traceroute'].filter(name => result[name] && !result[name].ok).length, 0);
-    $('status').textContent = failed ? 'Finished with ' + failed + ' failed check(s).' : 'Finished.';
-    render(msg.payload);
-  } else if (msg.type === 'error') {
-    running = false;
-    $('run').disabled = false;
-    $('status').innerHTML = '<span class="error">' + esc(msg.payload) + '</span>';
-  } else if (msg.type === 'focusDomain') {
-    $('domain').focus();
-    $('domain').select();
-  }
-});
-vscode.postMessage({ type: 'loadConfig' });
-</script>
-</body>
-</html>`;
+    async withRun(action) {
+        if (this.busy) {
+            this.post('notice', 'Đang chạy phép đo. Hãy chờ hoặc dừng trước.');
+            return;
+        }
+        this.busy = true;
+        try {
+            await action();
+        }
+        catch (error) {
+            this.post('error', (0, utils_1.errorMessage)(error));
+        }
+        finally {
+            this.busy = false;
+            this.controller = undefined;
+        }
     }
+    async handleDiagnostic(input) {
+        if (!input || !['dns', 'http'].includes(input.mode))
+            throw new Error('Chọn chế độ DNS records hoặc HTTP / WAF.');
+        if (typeof input.domain !== 'string' || input.domain.length > 8192)
+            throw new Error('Domain / URL không hợp lệ.');
+        const target = (0, utils_1.normalizeTarget)(input.domain);
+        const dnsOptions = input.mode === 'dns' ? (0, dnsDiagnostics_1.validateDnsOptions)(input.options) : undefined;
+        const httpOptions = input.mode === 'http' ? (0, httpDiagnostics_1.validateHttpOptions)(input.options) : undefined;
+        this.controller = new AbortController();
+        const run = { id: (0, node_crypto_1.randomUUID)(), mode: input.mode, startedAt: new Date().toISOString(), finishedAt: '' };
+        this.post('progress', input.mode === 'dns' ? 'Đang truy vấn DNS records…' : 'Đang đo HTTP từ máy chạy extension…');
+        if (dnsOptions)
+            run.dns = await (0, dnsDiagnostics_1.runDnsDiagnostics)(target.hostname, dnsOptions, this.controller.signal);
+        if (httpOptions)
+            run.http = await (0, httpDiagnostics_1.runHttpDiagnostics)(target, httpOptions, this.controller.signal, sample => {
+                this.post('sample', (0, reports_1.sanitizeReport)(sample));
+                this.post('progress', 'Mẫu ' + sample.index + ' · ' + (sample.route === 'origin' ? 'Client → origin' : 'URL công khai') + ' · ' + sample.outcome + ' · ' + Math.round(sample.totalMs) + ' ms');
+            });
+        run.finishedAt = new Date().toISOString();
+        this.save({ id: run.id, mode: run.mode, url: target.url, startedAt: run.startedAt, report: run });
+    }
+    async handleRun(request) {
+        if (!request || typeof request.domain !== 'string' || request.domain.length > 8192 || !request.selection)
+            throw new Error('Dữ liệu phép đo không hợp lệ.');
+        const target = (0, utils_1.normalizeTarget)(request.domain);
+        const selection = {};
+        for (const key of ['local', 'remote', 'dns', 'ping', 'http', 'traceroute'])
+            selection[key] = request.selection[key] === true;
+        if (!selection.local && !selection.remote)
+            throw new Error('Chọn Local và/hoặc Remote probes.');
+        if (![selection.dns, selection.ping, selection.http, selection.traceroute].some(Boolean))
+            throw new Error('Chọn ít nhất một loại kiểm tra.');
+        const networks = Array.isArray(request.networks) ? [...new Set(request.networks.filter(v => typeof v === 'string').map(v => v.trim()).filter(Boolean))] : [];
+        if (selection.remote && (!networks.length || networks.length > 8 || networks.some(v => v.length > 100)))
+            throw new Error('Nhập từ 1 đến 8 mạng, mỗi tên tối đa 100 ký tự.');
+        const cfg = vscode.workspace.getConfiguration('multiIspChecker');
+        const country = cfg.get('country', 'VN').toUpperCase();
+        const timeoutMs = Math.max(1000, Math.min(30000, cfg.get('timeoutMs', 8000)));
+        const token = process.env.GLOBALPING_TOKEN || cfg.get('globalpingToken', '') || undefined;
+        const startedAt = new Date().toISOString();
+        const results = [];
+        if (selection.local) {
+            this.post('progress', 'Đang kiểm tra kết nối local…');
+            results.push(await (0, localTester_1.runLocalTests)(target, selection, timeoutMs));
+        }
+        if (selection.remote) {
+            const client = new globalping_1.GlobalpingClient({ country, token });
+            this.post('progress', 'Đang kiểm tra Globalping từ ' + networks.length + ' mạng…');
+            results.push(...await Promise.all(networks.map(network => client.runNetwork(target, network, selection))));
+        }
+        const response = (0, analyzer_1.finalize)({ target, startedAt, finishedAt: new Date().toISOString(), results, comparison: [] });
+        this.save({ id: (0, node_crypto_1.randomUUID)(), mode: 'connectivity', url: target.url, startedAt, report: response });
+    }
+    async exportRun(id) {
+        const run = this.getRun(id);
+        const destination = await vscode.window.showSaveDialog({ saveLabel: 'Xuất JSON', filters: { JSON: ['json'] }, defaultUri: vscode.Uri.file('multi-isp-' + run.mode + '-' + run.id.slice(0, 8) + '.json') });
+        if (!destination)
+            return;
+        await vscode.workspace.fs.writeFile(destination, Buffer.from(JSON.stringify(run.report, null, 2), 'utf8'));
+        this.post('notice', 'Đã xuất JSON; không lưu request headers/body và đã ẩn giá trị query của URL.');
+    }
+    async importLogs(id) {
+        const run = this.getRun(id);
+        if (run.mode !== 'http')
+            throw new Error('Chọn một kết quả HTTP / WAF trước khi nhập log.');
+        const selected = await vscode.window.showOpenDialog({ canSelectMany: false, openLabel: 'Nhập log JSON / JSONL', filters: { 'JSON logs': ['json', 'jsonl', 'ndjson'] } });
+        if (!selected?.[0])
+            return;
+        const stat = await vscode.workspace.fs.stat(selected[0]);
+        if (stat.size > 2 * 1024 * 1024)
+            throw new Error('Log tối đa 2 MiB.');
+        const logs = (0, wafLogs_1.parseWafLogs)(Buffer.from(await vscode.workspace.fs.readFile(selected[0])).toString('utf8'));
+        const report = run.report;
+        const result = (0, wafLogs_1.correlateWafLogs)(report.http.samples, logs);
+        report.logMatches = result.matches;
+        report.logSummary = { imported: logs.length, matchedRecords: result.matchedRecords, unmatchedRecords: result.unmatchedRecords };
+        if (!this.busy && this.selectedId === run.id)
+            this.showRun(run);
+        this.post('notice', 'Khớp ' + result.matchedRecords + '/' + logs.length + ' bản ghi theo request ID. ID không có hoặc trùng nhiều mẫu không được gán timing. Các số là do log cung cấp, không phải phép đo WAF → origin của tool.');
+    }
+    html(webview) { return (0, diagnosticsView_1.renderDiagnosticsHtml)(webview); }
 }
 exports.CheckerViewProvider = CheckerViewProvider;
 //# sourceMappingURL=webview.js.map
